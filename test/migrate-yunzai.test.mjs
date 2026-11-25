@@ -2,8 +2,9 @@ import test from "node:test"
 import assert from "node:assert/strict"
 import { mkdir, mkdtemp, readFile, writeFile, rm, readdir, stat } from "node:fs/promises"
 import { dirname, join } from "node:path"
+import { open } from "node:fs/promises"
 import { tmpdir } from "node:os"
-import { migrateYunzai, oldHostIdentity } from "../migration/yunzai.js"
+import { migrateYunzai, oldHostIdentity, launchMigrationWorker } from "../migration/yunzai.js"
 
 async function fixture(run) {
   const parent = await mkdtemp(join(tmpdir(), "lotus-legacy-command-"))
@@ -52,7 +53,8 @@ test("clone failure never starts a worker and releases the command lock", () => 
   assert.equal(launches, 0)
   assert.equal(await readFile(join(source, "keep.txt"), "utf8"), "original")
   const control = join(dirname(source), ".lotus-yunzai-migration-old")
-  assert.ok(!(await readdir(control)).includes("active"))
+  const lease = JSON.parse(await readFile(join(control,"active/lease.json"),"utf8"))
+  assert.equal(JSON.parse(await readFile(lease.state,"utf8")).phase,"failed")
 }))
 
 test("an existing checkout is preserved and never overwritten", () => fixture(async (source, parent) => {
@@ -95,3 +97,40 @@ test("host identity retains original argv and private environment for recovery",
   assert.match(identity.startTimeTicks, /^\d+$/)
   assert.equal(identity.env.PATH, process.env.PATH)
 })
+
+ test("同时重试终态lease只允许一次克隆", () => fixture(async (source, parent) => {
+  const control = join(parent, ".lotus-yunzai-migration-old"), oldRun = join(control,"run-old"), active = join(control,"active");
+  await mkdir(oldRun,{recursive:true,mode:0o700});await mkdir(active,{mode:0o700});
+  await writeFile(join(oldRun,"state.json"),JSON.stringify({phase:"failed"}),{mode:0o600});
+  await writeFile(join(active,"lease.json"),JSON.stringify({state:join(oldRun,"state.json")}),{mode:0o600});
+  let release, clones=0;const barrier = new Promise(done=>release=done);
+  const options={source,oldHost:{pid:123},execute:async()=>{clones++;await barrier;throw Error("offline")}};
+  const first=migrateYunzai(options);
+  while(!clones)await new Promise(done=>setTimeout(done,5));
+  await assert.rejects(migrateYunzai(options),/正在进行/);release();
+  await assert.rejects(first);assert.equal(clones,1);
+}));
+
+test("真实worker通过桥接脱离旧bot子孙树，环境不含IPC句柄", () => fixture(async (source,parent) => {
+  const output=join(parent,"worker.json"),script=join(parent,"fake-worker.mjs");
+  await writeFile(script,`import {writeFile} from 'node:fs/promises';await writeFile(process.argv[2],JSON.stringify({pid:process.pid,ppid:process.ppid,channel:process.env.NODE_CHANNEL_FD}));setInterval(()=>{},1000);`);
+  const log=await open(join(parent,"bridge.log"),"w");let pid;
+  try{
+    pid=await launchMigrationWorker(process.execPath,[script,output],{cwd:source,env:process.env,log:log.fd});
+    for(let i=0;i<100&&!await readFile(output).catch(()=>null);i++)await new Promise(done=>setTimeout(done,10));
+    const data=JSON.parse(await readFile(output,"utf8"));assert.equal(data.pid,pid);assert.notEqual(data.ppid,process.pid);assert.equal(data.channel,undefined);
+    process.kill(pid,0);
+  }finally{if(pid)try{process.kill(pid,"SIGTERM")}catch{}await log.close()}
+}));
+
+test("准备阶段worker退出时明确失败，旧目录原件保留", () => fixture(async source => {
+  let statePath;
+  try{await migrateYunzai({source,oldHost:{pid:123},pollMs:10,timeoutMs:2000,execute:async(command,args)=>{
+    if(command!=="git")assert.fail("不能批准已退出的worker");
+    await mkdir(join(args.at(-1),"scripts"),{recursive:true});
+    await writeFile(join(args.at(-1),"scripts/legacy-migrate.mjs"),"export {}");
+  }})}catch(error){statePath=error.migrationState}
+  assert.ok(statePath);const status=JSON.parse(await readFile(statePath,"utf8"));
+  assert.equal(status.phase,"failed");assert.equal(status.recovery,"old-untouched");
+  assert.equal(await readFile(join(source,"keep.txt"),"utf8"),"original");
+}));

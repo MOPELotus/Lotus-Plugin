@@ -47,21 +47,48 @@ function execute(command, args, { cwd, env, log }) {
     child.once("exit", (code, signal) => code === 0 ? done() : reject(Error(`${migrationText("command")} (${code ?? signal})`)))
   })
 }
-async function detached(command, args, options) {
-  const child = spawn(command, args, { ...options, detached: true, stdio: ["ignore", options.log, options.log] })
-  await new Promise((done, reject) => { child.once("spawn", done); child.once("error", reject) })
-  child.unref()
-  return child.pid
+export async function launchMigrationWorker(command, args, options) {
+  // A separate session still belongs to the parent's PID tree. Reparent before PM2 tree-kill.
+  const bridge = `
+    const { spawn } = require('node:child_process');
+    process.once('message', ({command,args,cwd}) => {
+      const env = {...process.env};
+      for (const key of ['NODE_CHANNEL_FD','NODE_CHANNEL_SERIALIZATION_MODE','NODE_UNIQUE_ID']) delete env[key];
+      const worker = spawn(command,args,{cwd,env,detached:true,stdio:['ignore',1,2]});
+      worker.once('error',()=>process.exit(1));
+      worker.once('spawn',()=>{worker.unref();process.send({pid:worker.pid},()=>process.disconnect());});
+    });
+  `
+  const child = spawn(process.execPath, ["-e", bridge], {
+    cwd: options.cwd, env: options.env, stdio: ["ignore", options.log, options.log, "ipc"],
+  })
+  return new Promise((done, reject) => {
+    let pid
+    child.once("message", message => { if (Number.isSafeInteger(message?.pid) && message.pid > 1) pid = message.pid })
+    child.once("error", reject)
+    child.once("exit", code => code === 0 && pid ? done(pid) : reject(Error(migrationText("worker"))))
+    child.send({ command, args, cwd: options.cwd })
+  })
 }
 
 /** Prepare a new sibling checkout, then hand control to its independent migration worker. */
 export async function migrateYunzai(options = {}) {
   const source = await realpath(options.source || process.cwd())
   if (!(await lstat(join(source, "plugins"))).isDirectory()) throw Error(migrationText("unsafe"))
-  const host = options.oldHost || await oldHostIdentity()
   const parent = dirname(source)
   const control = join(parent, `.lotus-yunzai-migration-${basename(source)}`)
   await privateDirectory(control)
+  const claim = join(control, "claim")
+  try { await mkdir(claim, { mode: 0o700 }) }
+  catch (error) { if (error.code === "EEXIST") throw Error(migrationText("busy")); throw error }
+  let claimed = true
+  const release = async () => { if (claimed) { await rm(claim, { recursive: true }); claimed = false } }
+  try { return await migrateClaimed(options, source, parent, control, release) }
+  finally { await release() }
+}
+
+async function migrateClaimed(options, source, parent, control, releaseClaim) {
+  const host = options.oldHost || await oldHostIdentity()
   const lease = join(control, "active")
   try { await mkdir(lease, { mode: 0o700 }) }
   catch (error) {
@@ -81,12 +108,13 @@ export async function migrateYunzai(options = {}) {
     ? defaultTarget + "-" + Date.now() + "-" + randomUUID().slice(0, 6) : defaultTarget
   const environment = { ...process.env, ...(options.env || {}) }
   for (const name of ["pm_id", "NODE_APP_INSTANCE", "pm_exec_path", "pm_cwd", "NODE_OPTIONS", "NODE_CHANNEL_FD", "NODE_CHANNEL_SERIALIZATION_MODE", "NODE_UNIQUE_ID"]) delete environment[name]
-  const run = options.execute || execute, launch = options.launch || detached
+  const run = options.execute || execute, launch = options.launch || launchMigrationWorker
   const notify = options.onStep || (async () => {})
   let workerStarted = false
   await initialState(statePath, { version: 1, source, target, phase: "created", oldHost: host,
     requestedBy: String(options.requestedBy || ""), createdAt: new Date().toISOString() })
   await initialState(join(lease, "lease.json"), { state: statePath })
+  await releaseClaim()
   const log = await open(join(runDirectory, "launcher.log"), "ax", 0o600)
   const context = { cwd: parent, env: environment, log: log.fd }
   try {
@@ -97,12 +125,30 @@ export async function migrateYunzai(options = {}) {
     const worker = join(target, "scripts/legacy-migrate.mjs")
     if (!await exists(worker)) throw Error(migrationText("worker"))
     await initialState(statePath, { ...await readState(statePath), phase: "cloned" })
-    await launch(process.execPath, [worker, "--source", source, "--state", statePath], { ...context, cwd: target })
+    const workerPid = await launch(process.execPath, [worker, "--source", source, "--state", statePath], { ...context, cwd: target })
     workerStarted = true
+    let deadChecks = 0
+    const fingerprint = options.launch ? null : await oldHostIdentity(workerPid).catch(() => null)
     const deadline = Date.now() + (options.timeoutMs || 45 * 60_000)
     let phase = ""
     while (Date.now() < deadline) {
       const status = await readState(statePath)
+      if (!options.launch && status.phase !== "failed") {
+        const current = await oldHostIdentity(workerPid).catch(error => {
+          if (["ENOENT", "ESRCH"].includes(error.code)) return null
+          throw error
+        })
+        const live = current && fingerprint && current.startTimeTicks === fingerprint.startTimeTicks &&
+          current.execPath === fingerprint.execPath && current.cwd === fingerprint.cwd &&
+          JSON.stringify(current.argv) === JSON.stringify(fingerprint.argv)
+        deadChecks = live ? 0 : deadChecks + 1
+        if (deadChecks >= 2) {
+          if (["created", "cloned", "preparing", "installing", "ready-to-stop"].includes(status.phase)) {
+            await initialState(statePath, { ...status, phase: "failed", failedStage: status.phase, recovery: "old-untouched" })
+          }
+          throw Error(migrationText("worker"))
+        }
+      }
       if (status.phase === "failed") throw Error(migrationText("failed"))
       if (status.phase === "ready-to-stop") {
         await notify(migrationText("ready"))
@@ -116,7 +162,7 @@ export async function migrateYunzai(options = {}) {
   } catch (error) {
     if (!workerStarted) {
       await initialState(statePath, { ...await readState(statePath), phase: "failed", error: error.message })
-      await rm(lease, { recursive: true })
+      // Keep the terminal lease; only a new claim owner may replace it.
     }
     error.migrationState = statePath
     throw error
