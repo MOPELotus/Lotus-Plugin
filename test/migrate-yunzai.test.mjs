@@ -17,8 +17,9 @@ async function fixture(run) {
 test("direct migration command clones a sibling and approves only after the final reply", () => fixture(async source => {
   const calls = [], messages = []
   let statePath
-  const result = await migrateYunzai({ source, oldHost: { pid: 123 }, onStep: async message => messages.push(message),
-    execute: async (command, args) => {
+  const result = await migrateYunzai({ source, env: { name: "old-name", watch: "true", HTTP_PROXY: "http://proxy.invalid" }, oldHost: { pid: 123 }, onStep: async message => messages.push(message),
+    execute: async (command, args, context) => {
+      assert.equal(context.env.name, undefined); assert.equal(context.env.watch, undefined); assert.equal(context.env.HTTP_PROXY, "http://proxy.invalid")
       calls.push([command, ...args])
       if (command === "git") {
         const target = args.at(-1)
@@ -30,7 +31,8 @@ test("direct migration command clones a sibling and approves only after the fina
         const state = JSON.parse(await readFile(statePath, "utf8"))
         await writeFile(statePath, JSON.stringify({ ...state, handoffApproved: true }))
       }
-    }, launch: async (command, args) => {
+    }, launch: async (command, args, context) => {
+      assert.equal(context.env.name, undefined); assert.equal(context.env.watch, undefined)
       statePath = args.at(-1)
       const state = JSON.parse(await readFile(statePath, "utf8"))
       await writeFile(statePath, JSON.stringify({ ...state, phase: "ready-to-stop" }))

@@ -1,5 +1,6 @@
 import { constants } from "node:fs"
 import { spawn } from "node:child_process"
+import { migrationEnvironment } from "./environment.js"
 import { randomUUID } from "node:crypto"
 import { access, readFile, writeFile, mkdir, mkdtemp, lstat, realpath, readlink, rename, rm, open } from "node:fs/promises"
 import { basename, dirname, join, resolve } from "node:path"
@@ -112,8 +113,7 @@ async function migrateClaimed(options, source, parent, control, releaseClaim) {
   const defaultTarget = join(parent, "Lotus-Yunzai")
   const target = options.target ? resolve(options.target) : await exists(defaultTarget)
     ? defaultTarget + "-" + Date.now() + "-" + randomUUID().slice(0, 6) : defaultTarget
-  const environment = { ...process.env, ...(options.env || {}) }
-  for (const name of ["pm_id", "NODE_APP_INSTANCE", "pm_exec_path", "pm_cwd", "NODE_OPTIONS", "NODE_CHANNEL_FD", "NODE_CHANNEL_SERIALIZATION_MODE", "NODE_UNIQUE_ID"]) delete environment[name]
+  const environment = migrationEnvironment({ ...process.env, ...(options.env || {}) })
   const run = options.execute || execute, launch = options.launch || launchMigrationWorker
   const notify = options.onStep || (async () => {})
   let workerStarted = false
