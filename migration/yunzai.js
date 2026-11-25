@@ -1,6 +1,7 @@
+import { constants } from "node:fs"
 import { spawn } from "node:child_process"
 import { randomUUID } from "node:crypto"
-import { readFile, writeFile, mkdir, mkdtemp, lstat, realpath, readlink, rename, rm, open } from "node:fs/promises"
+import { access, readFile, writeFile, mkdir, mkdtemp, lstat, realpath, readlink, rename, rm, open } from "node:fs/promises"
 import { basename, dirname, join, resolve } from "node:path"
 
 const messages = JSON.parse(await readFile(new URL("./zh-CN.json", import.meta.url), "utf8")).messages
@@ -34,9 +35,14 @@ export async function oldHostIdentity(pid = process.pid) {
   ])
   const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ")
   const old = { pid, execPath, cwd, argv: command.toString().split("\0").filter(Boolean).slice(1), startTimeTicks: fields[19], env: { ...process.env } }
+  if (pid === process.pid) old.restoreArgv = [...process.execArgv, ...process.argv.slice(1)]
   if (process.env.pm_id !== undefined) {
     if (!/^\d+$/.test(process.env.pm_id)) throw Error(migrationText("unsafe"))
-    old.pm2 = { id: Number(process.env.pm_id), cli: "pm2" }
+    let cli = "pm2"
+    for (const candidate of [join(cwd,"node_modules/.bin/pm2"), join(cwd,"node_modules/pm2/bin/pm2")]) {
+      if (await access(candidate, constants.X_OK).then(() => true, () => false)) { cli = candidate; break }
+    }
+    old.pm2 = { id: Number(process.env.pm_id), cli }
   }
   return old
 }

@@ -1,6 +1,6 @@
 import test from "node:test"
 import assert from "node:assert/strict"
-import { mkdir, mkdtemp, readFile, writeFile, rm, readdir, stat } from "node:fs/promises"
+import { chmod, mkdir, mkdtemp, readFile, writeFile, rm, readdir, stat } from "node:fs/promises"
 import { dirname, join } from "node:path"
 import { open } from "node:fs/promises"
 import { tmpdir } from "node:os"
@@ -96,6 +96,7 @@ test("host identity retains original argv and private environment for recovery",
   assert.ok(identity.argv.length)
   assert.match(identity.startTimeTicks, /^\d+$/)
   assert.equal(identity.env.PATH, process.env.PATH)
+  assert.deepEqual(identity.restoreArgv, [...process.execArgv,...process.argv.slice(1)])
 })
 
  test("同时重试终态lease只允许一次克隆", () => fixture(async (source, parent) => {
@@ -134,3 +135,15 @@ test("准备阶段worker退出时明确失败，旧目录原件保留", () => fi
   assert.equal(status.phase,"failed");assert.equal(status.recovery,"old-untouched");
   assert.equal(await readFile(join(source,"keep.txt"),"utf8"),"original");
 }));
+
+for(const localPath of ["node_modules/.bin/pm2","node_modules/pm2/bin/pm2"]){
+ test(`优先旧宿主本地PM2：${localPath}`,()=>fixture(async source=>{
+  const originalCwd=process.cwd(),oldId=process.env.pm_id;
+  const executable=join(source,localPath);await mkdir(dirname(executable),{recursive:true});
+  await writeFile(executable,"#!/bin/sh\nexit 0\n");await chmod(executable,0o700);
+  try{process.chdir(source);process.env.pm_id="9";const identity=await oldHostIdentity();
+    assert.equal(identity.pm2.id,9);assert.equal(identity.pm2.cli,executable);
+    assert.deepEqual(identity.restoreArgv,[...process.execArgv,...process.argv.slice(1)]);
+  }finally{process.chdir(originalCwd);if(oldId===undefined)delete process.env.pm_id;else process.env.pm_id=oldId}
+ }));
+}
